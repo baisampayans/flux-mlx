@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+*.so
+*.dylib
+*.metallib
+
+# Model weights (download via DOWNLOAD.md instructions)
+models/FLUX2-klein-9B/**/*.safetensors
+models/FLUX2-klein-9B/**/*.json
+models/FLUX2-klein-9B/**/*.txt
+models/FLUX2-klein-9B/.cache/
+!models/FLUX2-klein-9B/**/DOWNLOAD.md
+
+# Generated images
+output*.png

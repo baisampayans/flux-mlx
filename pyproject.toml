@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flux-mlx"
+version = "0.1.0"
+description = "Flux2 Klein image generation optimized for Apple Silicon — pure MLX with adaptive Metal backends"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.30.0",
+    "numpy",
+    "pillow",
+    "tokenizers",
+]
+
+[project.optional-dependencies]
+dev = ["torch", "safetensors", "diffusers", "transformers", "coremltools"]
+
+[project.scripts]
+flux-mlx = "flux_mlx.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["flux_mlx*"]
