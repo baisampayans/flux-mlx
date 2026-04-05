@@ -17,12 +17,18 @@ A research project exploring Metal Performance Primitives (MPP) and Apple Silico
 
 **M3 Ultra, 1024×1024, 2 steps:**
 
-| | Cold Start | Steady State |
+| | Cold Start | Steady State | Speedup vs PyTorch |
+|---|---|---|---|
+| Stock diffusers (PyTorch MPS) | ~20s | ~18s | — |
+| mflux | 5.2s | 3.7s | **4.9x** |
+| **flux-mlx** | **5.0s** | **3.8s** | **4.7x** |
+| **flux-mlx + MPP** | **5.0s** | **3.7s** | **4.9x** |
+
+| | PyTorch | flux-mlx |
 |---|---|---|
-| Stock diffusers (PyTorch MPS) | ~20s | ~18s |
-| mflux | 5.2s | 3.7s |
-| **flux-mlx** | **5.0s** | **3.8s** |
-| **flux-mlx + MPP** | **5.0s** | **3.7s** |
+| **Model loading** | 8-12s | **<1s** |
+| **Install size** | ~8 GB (torch, diffusers, transformers, ...) | **~150 MB** (mlx, tokenizers, numpy) |
+| **Dependencies** | 30+ packages | **3 packages** |
 
 ## Quick Start
 
