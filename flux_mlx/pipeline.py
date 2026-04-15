@@ -14,7 +14,7 @@ import mlx.utils
 
 from flux_mlx.models.transformer import Flux2Config, Flux2Transformer
 from flux_mlx.models.text_encoder import Qwen3TextEncoder
-from flux_mlx.models.vae import Flux2VAEDecoder
+from flux_mlx.models.vae import Flux2VAEDecoder, Flux2VAEEncoder
 from flux_mlx import scheduler
 
 
@@ -60,9 +60,10 @@ class FluxPipeline:
         nbytes = sum(p.nbytes for _, p in mlx.utils.tree_flatten(self.transformer.parameters()))
         print(f"  Transformer: {params/1e9:.2f}B params, {nbytes/1e9:.1f} GB ({time.time()-t0:.1f}s)")
 
-        # Text encoder and VAE (lazy-loaded)
+        # Text encoder, VAE decoder and encoder (lazy-loaded)
         self.text_encoder = Qwen3TextEncoder(str(self.model_dir), dtype=dtype)
         self.vae = Flux2VAEDecoder(str(self.model_dir))
+        self.vae_encoder = Flux2VAEEncoder(str(self.model_dir), dtype=dtype)
 
     def _enable_mpp(self):
         """Monkey-patch nn.Linear to use MPP matmul2d for large projections."""
@@ -156,8 +157,10 @@ class FluxPipeline:
         num_steps: int = 2,
         seed: int = 42,
         guidance_scale: float = 1.0,
+        image: np.ndarray = None,
+        strength: float = 0.75,
     ) -> np.ndarray:
-        """Generate an image from a text prompt.
+        """Generate an image from a text prompt, optionally conditioned on an input image.
 
         Args:
             prompt: Text description of the desired image
@@ -166,6 +169,8 @@ class FluxPipeline:
             num_steps: Denoising steps (2 for Klein distilled)
             seed: Random seed for reproducibility
             guidance_scale: CFG scale (1.0 = no CFG for Klein)
+            image: Optional (H, W, 3) uint8 numpy array for image-to-image
+            strength: I2I strength 0-1 (lower = preserve more of input image)
 
         Returns:
             image: (H, W, 3) numpy array in uint8
@@ -174,7 +179,9 @@ class FluxPipeline:
         img_seq_len = (height // 16) * (width // 16)
         txt_seq_len = 512
 
-        print(f"\nGenerating {width}x{height}, {num_steps} steps, seed={seed}")
+        is_i2i = image is not None
+        mode = f"I2I strength={strength}" if is_i2i else "T2I"
+        print(f"\nGenerating {width}x{height}, {num_steps} steps, seed={seed}, {mode}")
 
         # 1. Text encoding
         t0 = time.time()
@@ -183,30 +190,56 @@ class FluxPipeline:
         t_text = time.time() - t0
         print(f"  Text encoding: {t_text:.1f}s")
 
-        # 2. Prepare latents and position IDs
-        latents = self._prepare_latents(height, width, seed)
+        # 2. Prepare position IDs
         img_ids, txt_ids = self._prepare_ids(height, width, txt_seq_len)
 
         # 3. Compute timestep schedule
         sigmas, mu = scheduler.get_sigmas(num_steps, img_seq_len)
+
+        # 4. Prepare latents
+        if is_i2i:
+            # Encode input image → latents
+            t0_enc = time.time()
+            image_latents = self.vae_encoder.encode(image, height, width)
+            mx.eval(image_latents)
+            print(f"  VAE encode: {time.time()-t0_enc:.1f}s")
+
+            # Determine start step based on strength
+            # strength=1.0 → start from pure noise (full T2I)
+            # strength=0.0 → no denoising (return input as-is)
+            start_step = max(0, int(num_steps * (1 - strength)))
+            if start_step >= num_steps:
+                start_step = num_steps - 1
+
+            # Add noise to image latents at the start_step sigma level
+            sigma_start = float(sigmas[start_step])
+            mx.random.seed(seed)
+            noise = mx.random.normal(image_latents.shape).astype(self.dtype)
+            # Flow matching noise schedule: x_t = (1 - sigma) * x_0 + sigma * noise
+            latents = (1 - sigma_start) * image_latents + sigma_start * noise
+            mx.eval(latents)
+
+            print(f"  I2I: starting at step {start_step+1}/{num_steps} (sigma={sigma_start:.3f})")
+        else:
+            # Pure noise for T2I
+            latents = self._prepare_latents(height, width, seed)
+            start_step = 0
+
         print(f"  Scheduler: mu={mu:.3f}, sigmas={sigmas}")
 
-        # 4. Denoising loop
+        # 5. Denoising loop (from start_step)
         t0 = time.time()
-        for i in range(num_steps):
+        for i in range(start_step, num_steps):
             sigma = float(sigmas[i])
             sigma_next = float(sigmas[i + 1])
 
-            # Transformer expects sigma (in [0,1]), multiplies by 1000 internally
             t_input = mx.array([sigma]).astype(self.dtype)
 
-            # Transformer forward
             noise_pred = self.transformer(
                 latents, prompt_embeds, t_input, img_ids, txt_ids
             )
             mx.eval(noise_pred)
 
-            # Euler step
             latents = scheduler.step(noise_pred, sigma, sigma_next, latents)
             mx.eval(latents)
 
@@ -216,12 +249,12 @@ class FluxPipeline:
         t_dit = time.time() - t0
         print(f"  DiT total: {t_dit:.1f}s")
 
-        # 5. VAE decode
+        # 6. VAE decode
         t0 = time.time()
-        image = self.vae.decode(latents, height, width)
+        result = self.vae.decode(latents, height, width)
         t_vae = time.time() - t0
         print(f"  VAE decode: {t_vae:.1f}s")
 
         print(f"  Total: {t_text + t_dit + t_vae:.1f}s")
 
-        return image  # (H, W, 3) uint8
+        return result  # (H, W, 3) uint8

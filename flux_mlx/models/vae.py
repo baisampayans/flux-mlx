@@ -1,7 +1,7 @@
-"""AutoencoderKL VAE Decoder for Flux2 Klein — pure MLX, no mflux dependency.
+"""AutoencoderKL VAE Encoder + Decoder for Flux2 Klein — pure MLX.
 
-Architecture: conv_in → mid_block (2 resnet + attention) → 4 up_blocks → conv_out
-Channels: 32 → 512 → 512 → 256 → 128 → 3, with 3x upsample (8x total)
+Decoder: conv_in → mid_block → 4 up_blocks → conv_out  (latents → image)
+Encoder: conv_in → 4 down_blocks → mid_block → conv_out (image → latents)
 """
 
 import time
@@ -80,6 +80,19 @@ class Upsample2D(nn.Module):
         return x.transpose(0, 3, 1, 2)
 
 
+class Downsample2D(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, stride=2, padding=0)
+
+    def __call__(self, x):
+        # Asymmetric padding (pad right and bottom by 1) to match PyTorch stride=2 padding=1
+        x = x.transpose(0, 2, 3, 1)  # NCHW → NHWC
+        x = mx.pad(x, [(0, 0), (0, 1), (0, 1), (0, 0)])  # pad H and W
+        x = self.conv(x)
+        return x.transpose(0, 3, 1, 2)
+
+
 class UpDecoderBlock2D(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, n_layers: int = 3,
                  groups: int = 32, eps: float = 1e-6, add_upsample: bool = True):
@@ -95,6 +108,24 @@ class UpDecoderBlock2D(nn.Module):
             x = resnet(x)
         for up in self.upsamplers:
             x = up(x)
+        return x
+
+
+class DownEncoderBlock2D(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, n_layers: int = 2,
+                 groups: int = 32, eps: float = 1e-6, add_downsample: bool = True):
+        super().__init__()
+        self.resnets = [
+            ResnetBlock2D(in_ch if i == 0 else out_ch, out_ch, groups, eps)
+            for i in range(n_layers)
+        ]
+        self.downsamplers = [Downsample2D(out_ch)] if add_downsample else []
+
+    def __call__(self, x):
+        for resnet in self.resnets:
+            x = resnet(x)
+        for down in self.downsamplers:
+            x = down(x)
         return x
 
 
@@ -118,14 +149,10 @@ class Decoder(nn.Module):
         groups = 32
         eps = 1e-6
 
-        # Input: 32 → 512
         self.conv_in = nn.Conv2d(32, 512, 3, padding=1)
-
-        # Mid block: resnet + attention + resnet
         self.mid_block = MidBlock(512, groups, eps)
 
-        # Up blocks (reversed channels)
-        reversed_ch = list(reversed(block_channels))  # [512, 512, 256, 128]
+        reversed_ch = list(reversed(block_channels))
         self.up_blocks = []
         for i, out_ch in enumerate(reversed_ch):
             in_ch = out_ch if i == 0 else reversed_ch[i - 1]
@@ -134,26 +161,21 @@ class Decoder(nn.Module):
                 add_upsample=(i < len(reversed_ch) - 1),
             ))
 
-        # Output
         self.conv_norm_out = nn.GroupNorm(groups, 128, eps=eps, pytorch_compatible=True)
         self.conv_out = nn.Conv2d(128, 3, 3, padding=1)
 
     def __call__(self, x):
-        # Input conv
         x = x.transpose(0, 2, 3, 1)
         x = self.conv_in(x)
         x = x.transpose(0, 3, 1, 2)
 
-        # Mid block
         x = self.mid_block.resnets[0](x)
         x = self.mid_block.attentions[0](x)
         x = self.mid_block.resnets[1](x)
 
-        # Up blocks
         for block in self.up_blocks:
             x = block(x)
 
-        # Output
         x = x.transpose(0, 2, 3, 1)
         x = self.conv_norm_out(x.astype(mx.float32)).astype(x.dtype)
         x = nn.silu(x)
@@ -161,7 +183,65 @@ class Decoder(nn.Module):
         return x.transpose(0, 3, 1, 2)
 
 
-# ── Full VAE (decoder + post_quant_conv + BatchNorm) ──────────
+# ── Encoder ───────────────────────────────────────────────────
+
+class Encoder(nn.Module):
+    """Flux2 VAE Encoder: (B, 3, H, W) → (B, 64, H/8, W/8).
+
+    4 down blocks: 128→128 (↓2), 128→256 (↓2), 256→512 (↓2), 512→512 (no ↓)
+    Total spatial reduction: 8x
+    Output: 64 channels (32 mean + 32 logvar for diagonal Gaussian)
+    """
+    def __init__(self):
+        super().__init__()
+        block_channels = [128, 256, 512, 512]
+        groups = 32
+        eps = 1e-6
+
+        # Input: 3 → 128
+        self.conv_in = nn.Conv2d(3, 128, 3, padding=1)
+
+        # Down blocks
+        self.down_blocks = []
+        prev_ch = 128
+        for i, out_ch in enumerate(block_channels):
+            self.down_blocks.append(DownEncoderBlock2D(
+                prev_ch, out_ch, n_layers=2, groups=groups, eps=eps,
+                add_downsample=(i < len(block_channels) - 1),  # No downsample on last block
+            ))
+            prev_ch = out_ch
+
+        # Mid block
+        self.mid_block = MidBlock(512, groups, eps)
+
+        # Output
+        self.conv_norm_out = nn.GroupNorm(groups, 512, eps=eps, pytorch_compatible=True)
+        self.conv_out = nn.Conv2d(512, 64, 3, padding=1)
+
+    def __call__(self, x):
+        # Input conv
+        x = x.transpose(0, 2, 3, 1)  # NCHW → NHWC
+        x = self.conv_in(x)
+        x = x.transpose(0, 3, 1, 2)  # NHWC → NCHW
+
+        # Down blocks
+        for block in self.down_blocks:
+            x = block(x)
+
+        # Mid block
+        x = self.mid_block.resnets[0](x)
+        x = self.mid_block.attentions[0](x)
+        x = self.mid_block.resnets[1](x)
+
+        # Output
+        x = x.transpose(0, 2, 3, 1)
+        x = self.conv_norm_out(x.astype(mx.float32)).astype(x.dtype)
+        x = nn.silu(x)
+        x = self.conv_out(x)
+        return x.transpose(0, 3, 1, 2)  # (B, 64, H/8, W/8)
+
+
+# ── Full VAE Decoder ─────────────────────────────────────────
 
 class Flux2VAEDecoder:
     """Complete VAE decoder with unpatchify and BatchNorm denormalization."""
@@ -183,24 +263,20 @@ class Flux2VAEDecoder:
         self._decoder = Decoder()
         self._post_quant_conv = nn.Conv2d(32, 32, 1)
 
-        # Load weights
         weights = mx.load(f"{self.model_dir}/vae/diffusion_pytorch_model.safetensors")
 
         fixed = {}
         for key, val in weights.items():
             if "num_batches_tracked" in key:
                 continue
-            if "encoder" in key:  # skip encoder weights
+            if "encoder" in key:
                 continue
 
-            # Conv weights: (out, in, kH, kW) → (out, kH, kW, in)
             if "weight" in key and val.ndim == 4:
                 val = val.transpose(0, 2, 3, 1)
 
-            # Key fix: to_out.0 → to_out
             mlx_key = key.replace("to_out.0.", "to_out.")
 
-            # Store BatchNorm stats separately
             if key == "bn.running_mean":
                 self._bn_mean = val
                 continue
@@ -210,7 +286,6 @@ class Flux2VAEDecoder:
 
             fixed[mlx_key] = val
 
-        # Load decoder and post_quant_conv weights
         decoder_weights = {k.replace("decoder.", ""): v for k, v in fixed.items() if k.startswith("decoder.")}
         pqc_weights = {k.replace("post_quant_conv.", ""): v for k, v in fixed.items() if k.startswith("post_quant_conv.")}
 
@@ -226,37 +301,153 @@ class Flux2VAEDecoder:
                img_ids: mx.array = None) -> np.ndarray:
         self._load()
 
-        # Reshape sequence → spatial: (B, seq, 128) → (B, 128, ph, pw)
         vae_scale = 8
         h = 2 * (height // (vae_scale * 2))
         w = 2 * (width // (vae_scale * 2))
         ph, pw = h // 2, w // 2
 
         B = latents.shape[0]
-        spatial = latents.reshape(B, ph, pw, 128).transpose(0, 3, 1, 2)  # (B, 128, ph, pw)
+        spatial = latents.reshape(B, ph, pw, 128).transpose(0, 3, 1, 2)
 
-        # BatchNorm denormalization
         bn_mean = self._bn_mean.reshape(1, -1, 1, 1)
         bn_std = mx.sqrt(self._bn_var.reshape(1, -1, 1, 1) + self._bn_eps)
         spatial = spatial * bn_std + bn_mean
 
-        # Unpatchify: (B, 128, ph, pw) → (B, 32, h, w)
         spatial = spatial.reshape(B, 32, 4, ph, pw)
         spatial = spatial.reshape(B, 32, 2, 2, ph, pw)
         spatial = spatial.transpose(0, 1, 4, 2, 5, 3)
         spatial = spatial.reshape(B, 32, ph * 2, pw * 2)
 
-        # Post-quant conv
-        spatial = spatial.transpose(0, 2, 3, 1)  # NHWC for conv
+        spatial = spatial.transpose(0, 2, 3, 1)
         spatial = self._post_quant_conv(spatial)
-        spatial = spatial.transpose(0, 3, 1, 2)  # back to NCHW
+        spatial = spatial.transpose(0, 3, 1, 2)
 
-        # Decode
         decoded = self._decoder(spatial)
         mx.eval(decoded)
 
-        # Post-process: (B, 3, H, W) → (H, W, 3) uint8
         img = decoded[0].transpose(1, 2, 0)
         img = mx.clip(img, -1, 1)
         img = ((img + 1) / 2 * 255).astype(mx.uint8)
         return np.array(img)
+
+
+# ── Full VAE Encoder ─────────────────────────────────────────
+
+class Flux2VAEEncoder:
+    """Complete VAE encoder with patchify and BatchNorm normalization.
+
+    Image (H, W, 3) uint8 → latents (1, seq, 128) matching pipeline format.
+    """
+
+    def __init__(self, model_dir: str, dtype=mx.bfloat16):
+        self.model_dir = model_dir
+        self.dtype = dtype
+        self._encoder = None
+        self._quant_conv = None
+        self._bn_mean = None
+        self._bn_var = None
+        self._bn_eps = 1e-4
+
+    def _load(self):
+        if self._encoder is not None:
+            return
+        t0 = time.time()
+
+        self._encoder = Encoder()
+        self._quant_conv = nn.Conv2d(64, 64, 1)
+
+        weights = mx.load(f"{self.model_dir}/vae/diffusion_pytorch_model.safetensors")
+
+        fixed = {}
+        for key, val in weights.items():
+            if "num_batches_tracked" in key:
+                continue
+            if "decoder" in key:
+                continue
+            if "post_quant_conv" in key:
+                continue
+
+            if "weight" in key and val.ndim == 4:
+                val = val.transpose(0, 2, 3, 1)
+
+            mlx_key = key.replace("to_out.0.", "to_out.")
+
+            if key == "bn.running_mean":
+                self._bn_mean = val
+                continue
+            elif key == "bn.running_var":
+                self._bn_var = val
+                continue
+
+            fixed[mlx_key] = val
+
+        encoder_weights = {k.replace("encoder.", ""): v for k, v in fixed.items() if k.startswith("encoder.")}
+        qc_weights = {k.replace("quant_conv.", ""): v for k, v in fixed.items() if k.startswith("quant_conv.")}
+
+        self._encoder.load_weights(list(encoder_weights.items()))
+        self._quant_conv.load_weights(list(qc_weights.items()))
+
+        mx.eval(self._encoder.parameters())
+        mx.eval(self._quant_conv.parameters())
+
+        print(f"  VAE encoder loaded in {time.time()-t0:.1f}s")
+
+    def encode(self, image: np.ndarray, height: int, width: int) -> mx.array:
+        """Encode an image to latents.
+
+        Args:
+            image: (H, W, 3) uint8 numpy array
+            height: Target latent height (image height, must be divisible by 16)
+            width: Target latent width (image width, must be divisible by 16)
+
+        Returns:
+            latents: (1, seq_len, 128) matching pipeline's latent format
+        """
+        self._load()
+
+        # Preprocess: uint8 → float [-1, 1], NHWC → NCHW
+        img = mx.array(image).astype(self.dtype) / 127.5 - 1.0
+        img = img[None]  # (1, H, W, 3)
+        img = img.transpose(0, 3, 1, 2)  # (1, 3, H, W)
+
+        # Encode → (1, 64, H/8, W/8)
+        encoded = self._encoder(img)
+        mx.eval(encoded)
+
+        # Quant conv
+        encoded = encoded.transpose(0, 2, 3, 1)
+        encoded = self._quant_conv(encoded)
+        encoded = encoded.transpose(0, 3, 1, 2)
+
+        # Split mean and logvar, sample from diagonal Gaussian
+        mean, logvar = mx.split(encoded, 2, axis=1)  # Each (1, 32, H/8, W/8)
+        logvar = mx.clip(logvar, -30.0, 20.0)
+        # Use mean directly (no sampling noise for deterministic encoding)
+        latents_spatial = mean  # (1, 32, H/8, W/8)
+
+        # Patchify FIRST: (B, 32, h, w) → (B, 128, ph, pw)
+        # Reverse of decoder's unpatchify
+        B = latents_spatial.shape[0]
+        vae_scale = 8
+        h = 2 * (height // (vae_scale * 2))
+        w = 2 * (width // (vae_scale * 2))
+        ph, pw = h // 2, w // 2
+
+        # (B, 32, h, w) → (B, 32, ph, 2, pw, 2)
+        spatial = latents_spatial.reshape(B, 32, ph, 2, pw, 2)
+        # → (B, 32, 2, 2, ph, pw)
+        spatial = spatial.transpose(0, 1, 3, 5, 2, 4)
+        # → (B, 128, ph, pw)
+        spatial = spatial.reshape(B, 128, ph, pw)
+
+        # THEN BatchNorm normalization (inverse of decoder's denormalization)
+        # Now spatial is (B, 128, ph, pw) — matches BN stats shape (128,)
+        bn_mean = self._bn_mean.reshape(1, -1, 1, 1)
+        bn_std = mx.sqrt(self._bn_var.reshape(1, -1, 1, 1) + self._bn_eps)
+        spatial = (spatial - bn_mean) / bn_std
+
+        # → (B, ph*pw, 128) = (B, seq, 128)
+        latents = spatial.reshape(B, 128, ph * pw).transpose(0, 2, 1)
+
+        mx.eval(latents)
+        return latents
